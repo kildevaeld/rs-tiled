@@ -218,7 +218,7 @@ pub struct Map {
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
-    pub tilesets: Vec<Tileset>,
+    pub tilesets: Vec<TilesetRef>,
     pub layers: Vec<Layer>,
     pub image_layers: Vec<ImageLayer>,
     pub object_groups: Vec<ObjectGroup>,
@@ -294,7 +294,7 @@ impl Map {
             object_groups,
             properties,
             background_colour: c,
-            infinite: infinite.unwrap_or(false)
+            infinite: infinite.unwrap_or(false),
         })
     }
 
@@ -303,9 +303,11 @@ impl Map {
         let mut maximum_gid: i32 = -1;
         let mut maximum_ts = None;
         for tileset in self.tilesets.iter() {
-            if tileset.first_gid as i32 > maximum_gid && tileset.first_gid <= gid {
-                maximum_gid = tileset.first_gid as i32;
-                maximum_ts = Some(tileset);
+            if let TilesetRef::Tileset(tileset) = tileset {
+                if tileset.first_gid as i32 > maximum_gid && tileset.first_gid <= gid {
+                    maximum_gid = tileset.first_gid as i32;
+                    maximum_ts = Some(tileset);
+                }
             }
         }
         maximum_ts
@@ -334,6 +336,21 @@ impl FromStr for Orientation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TilesetRef {
+    Path(String, u32),
+    Tileset(Tileset),
+}
+
+impl TilesetRef {
+    pub fn unwrap(&self) -> &Tileset {
+        match self {
+            TilesetRef::Tileset(v) => v,
+            _ => panic!("Attempted to unwrap an unloaded tileset!"),
+        }
+    }
+}
+
 /// A tileset, usually the tilesheet image.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Tileset {
@@ -357,8 +374,11 @@ impl Tileset {
         parser: &mut EventReader<R>,
         attrs: Vec<OwnedAttribute>,
         map_path: Option<&Path>,
-    ) -> Result<Tileset, TiledError> {
-        Tileset::new_internal(parser, &attrs).or_else(|_| Tileset::new_reference(&attrs, map_path))
+    ) -> Result<TilesetRef, TiledError> {
+        match Tileset::new_internal(parser, &attrs) {
+            Ok(v) => Ok(TilesetRef::Tileset(v)),
+            Err(_) => Tileset::new_reference(&attrs, map_path),
+        }
     }
 
     fn new_internal<R: Read>(
@@ -416,7 +436,7 @@ impl Tileset {
     fn new_reference(
         attrs: &Vec<OwnedAttribute>,
         map_path: Option<&Path>,
-    ) -> Result<Tileset, TiledError> {
+    ) -> Result<TilesetRef, TiledError> {
         let ((), (first_gid, source)) = get_attrs!(
             attrs,
             optionals: [],
@@ -427,14 +447,19 @@ impl Tileset {
             TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
         );
 
-        let tileset_path = map_path.ok_or(TiledError::Other("Maps with external tilesets must know their file location.  See parse_with_path(Path).".to_string()))?.with_file_name(source);
-        let file = File::open(&tileset_path).map_err(|_| {
-            TiledError::Other(format!(
-                "External tileset file not found: {:?}",
-                tileset_path
-            ))
-        })?;
-        Tileset::new_external(file, first_gid)
+        match map_path {
+            Some(path) => {
+                let tileset_path = path.with_file_name(source);
+                let file = File::open(&tileset_path).map_err(|_| {
+                    TiledError::Other(format!(
+                        "External tileset file not found: {:?}",
+                        tileset_path
+                    ))
+                })?;
+                Ok(TilesetRef::Tileset(Tileset::new_external(file, first_gid)?))
+            }
+            None => Ok(TilesetRef::Path(source, first_gid)),
+        }
     }
 
     fn new_external<R: Read>(file: R, first_gid: u32) -> Result<Tileset, TiledError> {
@@ -711,7 +736,7 @@ impl Layer {
 #[derive(Debug, PartialEq, Clone)]
 pub enum LayerData {
     Finite(Vec<Vec<LayerTile>>),
-    Infinite(HashMap<(i32, i32), Chunk>)
+    Infinite(HashMap<(i32, i32), Chunk>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -723,11 +748,10 @@ pub struct Chunk {
     pub tiles: Vec<Vec<LayerTile>>,
 }
 
-
 impl Chunk {
     pub(crate) fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,    
+        attrs: Vec<OwnedAttribute>,
         encoding: Option<String>,
         compression: Option<String>,
     ) -> Result<Chunk, TiledError> {
@@ -743,20 +767,16 @@ impl Chunk {
             TiledError::MalformedAttributes("layer must have a name".to_string())
         );
 
-       
-
         let tiles = parse_data_line(encoding, compression, parser, width)?;
-        
         Ok(Chunk {
-                x,
-                y,
-                width,
-                height,
-                tiles,
-            })
+            x,
+            y,
+            width,
+            height,
+            tiles,
+        })
     }
 }
-
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImageLayer {
@@ -1075,12 +1095,11 @@ fn parse_infinite_data<R: Read>(
         required: [],
         TiledError::MalformedAttributes("data must have an encoding and a compression".to_string())
     );
-    
     let mut chunks = HashMap::<(i32, i32), Chunk>::new();
     parse_tag!(parser, "data", {
         "chunk" => |attrs| {
-            let chunk = Chunk::new(parser, attrs, e.clone(), c.clone())?;            
-            chunks.insert((chunk.x, chunk.y), chunk);            
+            let chunk = Chunk::new(parser, attrs, e.clone(), c.clone())?;
+            chunks.insert((chunk.x, chunk.y), chunk);
             Ok(())
         }
     });
@@ -1108,7 +1127,12 @@ fn parse_data<R: Read>(
     Ok(LayerData::Finite(tiles))
 }
 
-fn parse_data_line<R: Read>(encoding: Option<String>, compression: Option<String>, parser: &mut EventReader<R>, width: u32) -> Result<Vec<Vec<LayerTile>>, TiledError> {
+fn parse_data_line<R: Read>(
+    encoding: Option<String>,
+    compression: Option<String>,
+    parser: &mut EventReader<R>,
+    width: u32,
+) -> Result<Vec<Vec<LayerTile>>, TiledError> {
     match (encoding, compression) {
         (None, None) => {
             return Err(TiledError::Other(
